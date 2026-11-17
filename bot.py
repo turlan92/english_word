@@ -7,10 +7,8 @@ import sqlite3
 import io
 import secrets
 import logging
-import tempfile
 from contextlib import contextmanager
 from catalog import migrate, backup, parse_import, import_rows, HEADERS
-import audiobook
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -19,8 +17,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-                           FSInputFile, BufferedInputFile)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
@@ -36,8 +33,6 @@ if DEFAULT_LIMIT < 0:
 
 DEFAULT_REMINDER_HOUR = 7
 REMINDER_HOURS = (6, 7, 8, 9, 12, 18, 20, 21)
-TTS_VOICE = 'en-US-GuyNeural'
-TRANSCRIBE_LOCK = asyncio.Semaphore(1)  # whisper is heavy on CPU: one chapter at a time
 
 
 # ---------------------------------------------------------------- time ----
@@ -114,7 +109,6 @@ def init_db():
         db.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
             registered_at TEXT NOT NULL, last_seen TEXT NOT NULL)""")
-        db.execute('CREATE TABLE IF NOT EXISTS audio_cache (text TEXT PRIMARY KEY, file_id TEXT)')
         migrate_due_at_utc(db)
 
 def current_settings(db,user_id):
@@ -328,42 +322,6 @@ async def send_next(message,user_id):
         parse_mode='HTML',
         reply_markup=kb
     )
-
-# --------------------------------------------------------- pronunciation ----
-def get_audio_id(text):
-    with connect() as db:
-        row = db.execute('SELECT file_id FROM audio_cache WHERE text=?', (text,)).fetchone()
-    return row['file_id'] if row else None
-
-def save_audio_id(text, file_id):
-    with connect() as db:
-        db.execute('INSERT OR REPLACE INTO audio_cache(text,file_id) VALUES(?,?)', (text, file_id))
-
-async def send_pronunciation(message, item):
-    """Word + example spoken by edge-tts. Audio lives only on Telegram servers (file_id in
-    audio_cache); the mp3 is a temp file deleted right after upload. Any failure = no sound."""
-    text = item['verb'] + (('. ' + item['example']) if item['example'] else '')
-    path = None
-    try:
-        file_id = await asyncio.to_thread(get_audio_id, text)
-        if file_id:
-            await message.answer_audio(file_id)
-            return
-        import edge_tts
-        fd, path = tempfile.mkstemp(suffix='.mp3')
-        os.close(fd)
-        await asyncio.wait_for(edge_tts.Communicate(text, TTS_VOICE).save(path), timeout=30)
-        msg = await message.answer_audio(FSInputFile(path, filename='pronunciation.mp3'), title=item['verb'])
-        if msg.audio:
-            await asyncio.to_thread(save_audio_id, text, msg.audio.file_id)
-    except Exception:
-        logging.exception('Pronunciation failed for %r', text)
-    finally:
-        if path:
-            try:
-                os.remove(path)
-            except OSError:
-                logging.exception('Could not delete temp audio %s', path)
 
 async def show_stats(message,user_id):
     with connect() as db:
@@ -602,7 +560,6 @@ async def answer_cb(q:CallbackQuery):
         detail += f"\nТвой ответ: {escape(selected['verb'])} — {escape(selected['meaning_ru'])}"
     await q.message.answer(f"{'✅ Верно!' if correct else '❌ Неверно.'}\n<b>{escape(item['verb'])}</b> — {escape(item['meaning_ru'])}{detail}\n"+
         ('Повторение запланировано.' if correct else 'Повторим через 5 минут.'),parse_mode='HTML',reply_markup=menu())
-    await send_pronunciation(q.message, item)
 
 @dp.callback_query(F.data.startswith('page:'))
 async def page_cb(q:CallbackQuery):
@@ -638,51 +595,6 @@ async def users(message:Message):
             GROUP BY u.user_id ORDER BY u.last_seen DESC LIMIT 20""").fetchall()
     lines=[f"{r['user_id']} {(r['first_name'] or '')[:40]}: начато {r['n']}, верно {r['c']}, ошибок {r['w']}" for r in rows]
     await message.answer(f'Пользователей: {count}. Последние 20 активных:\n'+'\n'.join(lines))
-
-def is_mp3(message:Message):
-    if message.audio:
-        return True
-    doc = message.document
-    return bool(doc and ((doc.file_name or '').lower().endswith('.mp3') or doc.mime_type == 'audio/mpeg'))
-
-@dp.message(is_mp3)
-async def audiobook_chapter(message:Message, bot:Bot):
-    """mp3 with caption 'Книга; Глава N' -> chapter text (.txt) + prompt for Claude."""
-    try:
-        book, chapter = audiobook.parse_caption(message.caption)
-    except ValueError as exc:
-        await message.answer(str(exc)); return
-    media = message.audio or message.document
-    if not media.file_size or media.file_size > audiobook.MAX_FILE_SIZE:
-        await message.answer('Файл больше 20 МБ: Telegram не даёт боту его скачать. Разрежь главу на части и пришли по одной.'); return
-    status = await message.answer('Скачал, распознаю речь. Это может занять несколько минут…'
-                                  if not TRANSCRIBE_LOCK.locked() else 'Жду очереди: сейчас распознаётся другая глава…')
-    path = None
-    try:
-        fd, path = tempfile.mkstemp(suffix='.mp3')
-        os.close(fd)
-        await bot.download(media, destination=path)
-        async with TRANSCRIBE_LOCK:
-            text = await asyncio.to_thread(audiobook.transcribe, path)
-    except ValueError as exc:
-        await message.answer(str(exc)); return
-    except Exception:
-        logging.exception('Audiobook transcription failed')
-        await message.answer('Не удалось распознать файл. Подробности в журнале бота.'); return
-    finally:
-        if path:
-            try:
-                os.remove(path)
-            except OSError:
-                logging.exception('Could not delete temp audio %s', path)
-    await message.answer_document(
-        BufferedInputFile(text.encode('utf-8'), filename=audiobook.txt_filename(book, chapter)),
-        caption=f'📖 {book}, глава {chapter}. Отправь этот файл Claude вместе с промтом ниже.')
-    await message.answer(audiobook.build_prompt(book, chapter))
-    try:
-        await status.delete()
-    except Exception:
-        pass
 
 @dp.message(F.document)
 async def import_document(message:Message, bot:Bot):
