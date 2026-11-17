@@ -1,4 +1,4 @@
-"""Catalog migration and validated imports. No Telegram dependency."""
+"""Catalog migration and validated, append-only imports. No Telegram dependency."""
 import csv
 import io
 import sqlite3
@@ -8,7 +8,6 @@ from pathlib import Path
 from zipfile import ZipFile, BadZipFile
 
 HEADERS = ['книга', 'глава', 'слово', 'перевод', 'пример', 'перевод примера']
-KEEP_BACKUPS = 20
 
 @contextmanager
 def database(path):
@@ -29,12 +28,6 @@ def backup(path):
     target = folder / (path.stem + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f') + '.sqlite3')
     with database(path) as src, database(target) as dst:
         src.backup(dst)
-    # keep only the newest KEEP_BACKUPS copies of this database (names sort by timestamp)
-    for old in sorted(folder.glob(path.stem + '_*.sqlite3'))[:-KEEP_BACKUPS]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
 
 def migrate(path):
     with database(path) as db:
@@ -112,11 +105,8 @@ def parse_import(data, filename):
     return result
 
 def import_rows(path, rows):
-    """Adds new words. For a word that already exists, only EMPTY example fields are filled in.
-    Returns (added, updated, skipped)."""
     backup(path)
-    added = updated = skipped = 0
-    norm = lambda s: ' '.join(s.split()).casefold()
+    added = skipped = 0
     with database(path) as db:
         db.execute('BEGIN IMMEDIATE')
         for book, chapter, verb, meaning, example, example_ru in rows:
@@ -127,20 +117,13 @@ def import_rows(path, rows):
                 n = db.execute('SELECT COUNT(*) FROM collections').fetchone()[0] + 1
                 section = f'set{n}'
                 db.execute('INSERT INTO collections VALUES(?,?,?)', (section, book, chapter))
-            known = db.execute('SELECT id,verb,meaning_ru,example,example_ru FROM catalog WHERE section=?', (section,)).fetchall()
-            match = next((r for r in known if norm(r['verb']) == norm(verb) and norm(r['meaning_ru']) == norm(meaning)), None)
-            if match:
-                old_ex, old_ru = match['example'] or '', match['example_ru'] or ''
-                new_ex = old_ex or example
-                new_ru = old_ru or example_ru
-                if (new_ex, new_ru) != (old_ex, old_ru):
-                    db.execute('UPDATE catalog SET example=?, example_ru=? WHERE id=?', (new_ex, new_ru, match['id']))
-                    updated += 1
-                else:
-                    skipped += 1
+            known = db.execute('SELECT verb,meaning_ru FROM catalog WHERE section=?', (section,)).fetchall()
+            norm = lambda s: ' '.join(s.split()).casefold()
+            if any(norm(r['verb']) == norm(verb) and norm(r['meaning_ru']) == norm(meaning) for r in known):
+                skipped += 1
                 continue
             order = db.execute('SELECT COALESCE(MAX(sort_order),0)+1 FROM catalog WHERE section=?', (section,)).fetchone()[0]
             db.execute('''INSERT INTO catalog(section,verb,meaning_ru,sort_order,example,example_ru)
                 VALUES(?,?,?,?,?,?)''', (section, verb, meaning, order, example, example_ru))
             added += 1
-    return added, updated, skipped
+    return added, skipped
